@@ -1,0 +1,54 @@
+name: 美股指数日报
+
+on:
+  schedule:
+    # GitHub Actions 的 cron 使用 UTC。22:30 UTC 对应美东 17:30(EDT) / 17:30(EST)，
+    # 两个时段都在收盘之后，因此夏令时切换无需改动。
+    - cron: "30 22 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "最新收盘日不是当天也照常发送"
+        type: boolean
+        default: false
+
+concurrency:
+  group: daily-report
+  cancel-in-progress: false
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: 生成并发送日报
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          MAIL_FROM: ${{ secrets.MAIL_FROM }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+        run: |
+          python -m ndxmon.main \
+            --out out/preview.html \
+            ${{ inputs.force && '--force' || '' }}
+
+      # 失败时保留渲染结果便于排查；任务本身失败会由 GitHub 自动发邮件给仓库所有者。
+      - name: 保留渲染产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: preview
+          path: out/
+          if-no-files-found: ignore
+          retention-days: 7

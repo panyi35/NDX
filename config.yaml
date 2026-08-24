@@ -1,0 +1,27 @@
+# 监控标的。code 为腾讯行情代码，yahoo 为兜底数据源代码。
+indices:
+  - name: 纳斯达克100
+    code: usNDX
+    yahoo: "^NDX"
+  - name: 标普500
+    code: usINX
+    yahoo: "^GSPC"
+  - name: 道琼斯
+    code: usDJI
+    yahoo: "^DJI"
+
+history:
+  # 计算历史最高收盘价的起始日期。腾讯源最早可回溯到 2000-01-03，
+  # 已覆盖 2000 年互联网泡沫顶，对上述指数的历史高点判定是足够的。
+  start: "2000-01-01"
+
+report:
+  # 邮件正文中额外展示的回溯窗口涨跌幅，单位为交易日。
+  lookback_days: [5, 20, 60]
+  # 单日涨跌幅绝对值超过该值时视为数据异常，中止运行而不是发出错误的邮件。
+  sanity_max_day_pct: 20.0
+
+email:
+  subject_prefix: "[美股指数]"
+  # 收件人也可用环境变量 MAIL_TO 覆盖（逗号分隔）。
+  to: []
