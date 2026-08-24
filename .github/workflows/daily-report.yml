@@ -8,9 +8,10 @@ on:
   workflow_dispatch:
     inputs:
       force:
+        # 人工触发通常是为了立刻看到结果，默认开启；取消勾选可复现定时任务的休市跳过行为。
         description: "最新收盘日不是当天也照常发送"
         type: boolean
-        default: false
+        default: true
 
 concurrency:
   group: daily-report
