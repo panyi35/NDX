@@ -30,8 +30,15 @@ def _signed(value: float | None) -> str:
     return f"{value:+,.2f}"
 
 
+Failures = list[tuple[str, str]]
+
+
 def render_html(
-    reports: list[IndexReport], trade_day: str, generated_at: datetime
+    reports: list[IndexReport],
+    trade_day: str,
+    generated_at: datetime,
+    failures: Failures | None = None,
+    heartbeat: bool = False,
 ) -> str:
     sources = "、".join(sorted({r.source for r in reports}))
     return _env.get_template("email.html.j2").render(
@@ -39,18 +46,33 @@ def render_html(
         trade_day=trade_day,
         generated_at=generated_at.strftime("%Y-%m-%d %H:%M"),
         sources=sources,
+        failures=failures or [],
+        heartbeat=heartbeat,
         color=_color,
         signed=_signed,
     )
 
 
-def render_subject(prefix: str, reports: list[IndexReport], trade_day: str) -> str:
+def render_subject(
+    prefix: str,
+    reports: list[IndexReport],
+    trade_day: str,
+    failures: Failures | None = None,
+    heartbeat: bool = False,
+) -> str:
     """主题行直接带上核心数字，手机通知栏不点开也能看到。"""
+    tags = ""
+    if heartbeat:
+        tags += "[周度心跳]"
+    if failures:
+        tags += f"[{len(failures)} 项数据缺失]"
     parts = [f"{r.name} {r.day_pct:+.2f}%" for r in reports]
-    return f"{prefix} {trade_day} " + " | ".join(parts)
+    return f"{prefix}{tags} {trade_day} " + " | ".join(parts)
 
 
-def render_text(reports: list[IndexReport], trade_day: str) -> str:
+def render_text(
+    reports: list[IndexReport], trade_day: str, failures: Failures | None = None
+) -> str:
     """纯文本兜底，供不渲染 HTML 的客户端使用。"""
     lines = [f"美股指数日报 {trade_day}（美东收盘）", ""]
     for r in reports:
@@ -67,4 +89,6 @@ def render_text(reports: list[IndexReport], trade_day: str) -> str:
                 f"回撤 {r.drawdown_pct:+.2f}%，已 {r.trading_days_since_ath} 个交易日未创新高"
             )
         lines.append("")
+    for name, err in failures or []:
+        lines.append(f"{name}：数据获取失败 - {err}")
     return "\n".join(lines)

@@ -43,6 +43,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="即使最新收盘日不是当天（休市或数据未更新）也照常出报",
     )
+    parser.add_argument(
+        "--heartbeat",
+        action="store_true",
+        help="标记为周度心跳，用于确认定时任务仍在运行",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -56,21 +61,32 @@ def main(argv: list[str] | None = None) -> int:
     lookbacks = tuple(rcfg.get("lookback_days") or (5, 20, 60))
     max_day_pct = float(rcfg.get("sanity_max_day_pct", 20.0))
 
-    reports = []
+    # 单个指数失败不应连带其他指数：失败项记入 failures，在邮件中标注出来。
+    reports, failures = [], []
     for item in cfg["indices"]:
-        bars, source = fetch_history(item["code"], item.get("yahoo", ""), start)
-        log.info(
-            "%s: %d 根日线 (%s ~ %s) 来自 %s",
-            item["name"], len(bars), bars[0].day, bars[-1].day, source,
-        )
-        reports.append(
-            build_report(item["name"], bars, source, lookbacks, max_day_pct)
-        )
+        name = item["name"]
+        try:
+            bars, source = fetch_history(
+                item["code"], item.get("eastmoney", ""), start
+            )
+            log.info(
+                "%s: %d 根日线 (%s ~ %s) 来自 %s",
+                name, len(bars), bars[0].day, bars[-1].day, source,
+            )
+            reports.append(build_report(name, bars, source, lookbacks, max_day_pct))
+        except Exception as exc:  # noqa: BLE001
+            log.error("%s: 获取或计算失败，本次跳过该指数: %s", name, exc)
+            failures.append((name, str(exc)))
+
+    if not reports:
+        log.error("所有指数均失败，不发送邮件")
+        return 1
 
     # 交易日判定不依赖假日表：拿最新一根日线的日期与美东当日比对即可。
     today_et = datetime.now(ET).date()
     trade_day = max(r.last_day for r in reports)
-    if trade_day != today_et and not args.force:
+    # 心跳的意义在于「一定会到达」，因此不受交易日判定的影响。
+    if trade_day != today_et and not (args.force or args.heartbeat):
         reason = "周末" if today_et.weekday() >= 5 else "美股休市或数据尚未更新"
         log.info("最新收盘日 %s 不是美东当日 %s（%s），跳过发送", trade_day, today_et, reason)
         return 0
@@ -79,12 +95,16 @@ def main(argv: list[str] | None = None) -> int:
     if stale:
         log.warning("以下指数的收盘日落后于 %s: %s", trade_day, "、".join(stale))
 
-    html = render.render_html(reports, str(trade_day), datetime.now(CN))
-    text = render.render_text(reports, str(trade_day))
+    html = render.render_html(
+        reports, str(trade_day), datetime.now(CN), failures, args.heartbeat
+    )
+    text = render.render_text(reports, str(trade_day), failures)
     subject = render.render_subject(
         (cfg.get("email") or {}).get("subject_prefix", "[美股指数]"),
         reports,
         str(trade_day),
+        failures,
+        args.heartbeat,
     )
 
     if args.out:

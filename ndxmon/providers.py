@@ -1,27 +1,40 @@
 """日线历史数据源。
 
-主源为腾讯行情（国内直连可用），失败时回落到 Yahoo Finance
-（GitHub Actions 的美国 runner 上可用，国内直连通常返回 403）。
-两个源都只取日线收盘价，指数无需复权。
+主源为腾讯行情，备源为东方财富，两者在国内直连和 GitHub 的美国 runner 上都可用。
+
+不使用 Yahoo Finance：它现在要求 cookie + crumb 握手，裸 GET 会返回 403/429，
+作为兜底等于没有兜底。
 """
 
 from __future__ import annotations
 
 import logging
+import random
 import time
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, timedelta
 
 import requests
 
 log = logging.getLogger(__name__)
 
-_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/126.0 Safari/537.36"
+_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        "Chrome/126.0 Safari/537.36"
+    ),
+    "Referer": "https://quote.eastmoney.com/",
+}
 
 # 腾讯单次请求最多返回 800 根日线，需要按结束日期向前翻页。
 _TENCENT_PAGE = 800
 _TENCENT_URL = "https://web.ifzq.gtimg.cn/appstock/app/usfqkline/get"
-_YAHOO_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+
+# 东方财富单次即可返回全量历史，但限流较严：短时间内密集请求会被按 IP 拒绝，
+# 表现为返回空响应（连接被直接关闭），且封禁会持续数分钟。因此每次请求前留出间隔。
+_EASTMONEY_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+_EASTMONEY_GAP_SECONDS = 3.0
+_last_eastmoney_call = 0.0
 
 
 class DataSourceError(RuntimeError):
@@ -37,11 +50,16 @@ class Bar:
     close: float
 
 
-def fetch_history(code: str, yahoo_symbol: str, start: date) -> tuple[list[Bar], str]:
+def fetch_history(
+    tencent_code: str, eastmoney_secid: str, start: date
+) -> tuple[list[Bar], str]:
     """返回 (按日期升序的日线, 实际使用的数据源名)。"""
+    attempts = [("tencent", _fetch_tencent, tencent_code)]
+    if eastmoney_secid:
+        attempts.append(("eastmoney", _fetch_eastmoney, eastmoney_secid))
+
     errors = []
-    for name, fn in (("tencent", _fetch_tencent), ("yahoo", _fetch_yahoo)):
-        symbol = code if name == "tencent" else yahoo_symbol
+    for name, fn, symbol in attempts:
         try:
             bars = fn(symbol, start)
             if bars:
@@ -50,22 +68,23 @@ def fetch_history(code: str, yahoo_symbol: str, start: date) -> tuple[list[Bar],
         except Exception as exc:  # noqa: BLE001 - 任一源失败都应尝试下一个
             log.warning("数据源 %s 获取 %s 失败: %s", name, symbol, exc)
             errors.append(f"{name}: {exc}")
-    raise DataSourceError(f"所有数据源均失败 ({code}) -> " + "; ".join(errors))
+    raise DataSourceError(
+        f"所有数据源均失败 ({tencent_code}) -> " + "; ".join(errors)
+    )
 
 
-def _get_json(url: str, params: dict | None = None, retries: int = 3) -> dict:
+def _get_json(url: str, params: dict, retries: int = 4) -> dict:
+    """带指数退避的 GET。限流表现为空响应或连接中断，因此需要重试。"""
     last = None
     for attempt in range(retries):
         try:
-            resp = requests.get(
-                url, params=params, headers={"User-Agent": _UA}, timeout=20
-            )
+            resp = requests.get(url, params=params, headers=_HEADERS, timeout=20)
             resp.raise_for_status()
             return resp.json()
         except Exception as exc:  # noqa: BLE001
             last = exc
             if attempt < retries - 1:
-                time.sleep(2**attempt)
+                time.sleep(2**attempt + random.uniform(0, 0.5))
     raise DataSourceError(str(last))
 
 
@@ -81,11 +100,7 @@ def _fetch_tencent(code: str, start: date) -> list[Bar]:
             raise DataSourceError(f"接口返回异常: {payload.get('msg') or payload}")
         node = data.get(code) or {}
         rows = node.get("qfqday") or node.get("day") or []
-        if not rows:
-            break
-
-        page = [_parse_tencent_row(r) for r in rows]
-        page = [b for b in page if b is not None]
+        page = [b for b in (_parse_ohlc(r) for r in rows) if b is not None]
         if not page:
             break
 
@@ -97,12 +112,44 @@ def _fetch_tencent(code: str, start: date) -> list[Bar]:
             break
         end = (oldest - timedelta(days=1)).isoformat()
 
-    bars = [b for d, b in sorted(collected.items()) if d >= start]
-    return bars
+    return [b for d, b in sorted(collected.items()) if d >= start]
 
 
-def _parse_tencent_row(row: list) -> Bar | None:
-    # 行格式: [日期, 开, 收, 高, 低, 成交量, ...]
+def _fetch_eastmoney(secid: str, start: date) -> list[Bar]:
+    global _last_eastmoney_call
+    wait = _EASTMONEY_GAP_SECONDS - (time.monotonic() - _last_eastmoney_call)
+    if wait > 0:
+        time.sleep(wait)
+    _last_eastmoney_call = time.monotonic()
+
+    payload = _get_json(
+        _EASTMONEY_URL,
+        {
+            "secid": secid,
+            "fields1": "f1,f2,f3",
+            "fields2": "f51,f52,f53,f54,f55,f56",
+            "klt": "101",  # 日线
+            "fqt": "1",
+            "beg": "0",
+            "end": "20500101",
+        },
+    )
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        raise DataSourceError(f"接口返回异常: {payload}")
+
+    rows = [line.split(",") for line in (data.get("klines") or [])]
+    bars = [b for b in (_parse_ohlc(r) for r in rows) if b is not None]
+    bars.sort(key=lambda b: b.day)
+    return [b for b in bars if b.day >= start]
+
+
+def _parse_ohlc(row: list) -> Bar | None:
+    """腾讯与东方财富的行结构一致: [日期, 开, 收, 高, 低, 成交量, ...]。
+
+    注意第 2、3 位是「收、高」而非直觉上的「高、低」，弄反会导致
+    历史最高点被算成最高收盘价之上的值。
+    """
     try:
         return Bar(
             day=date.fromisoformat(row[0]),
@@ -113,37 +160,3 @@ def _parse_tencent_row(row: list) -> Bar | None:
         )
     except (ValueError, IndexError, TypeError):
         return None
-
-
-def _fetch_yahoo(symbol: str, start: date) -> list[Bar]:
-    payload = _get_json(
-        _YAHOO_URL.format(symbol=symbol),
-        {"range": "max", "interval": "1d", "includePrePost": "false"},
-    )
-    result = (payload.get("chart") or {}).get("result") or []
-    if not result:
-        raise DataSourceError(f"接口返回异常: {payload}")
-    node = result[0]
-    stamps = node.get("timestamp") or []
-    quote = (node.get("indicators") or {}).get("quote") or [{}]
-    q = quote[0]
-
-    bars = []
-    for i, ts in enumerate(stamps):
-        o, h, l, c = (q.get(k, [])[i] for k in ("open", "high", "low", "close"))
-        if c is None:
-            continue  # 尚未收盘或数据缺失的交易日
-        day = _yahoo_trading_day(ts, node)
-        if day < start:
-            continue
-        bars.append(
-            Bar(day=day, open=o or c, high=h or c, low=l or c, close=float(c))
-        )
-    bars.sort(key=lambda b: b.day)
-    return bars
-
-
-def _yahoo_trading_day(ts: int, node: dict) -> date:
-    """Yahoo 的时间戳是 UTC 秒，需叠加交易所偏移才能还原出正确的交易日。"""
-    offset = ((node.get("meta") or {}).get("gmtoffset")) or 0
-    return datetime.fromtimestamp(ts + offset, tz=timezone.utc).date()

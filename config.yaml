@@ -1,14 +1,15 @@
-# 监控标的。code 为腾讯行情代码，yahoo 为兜底数据源代码。
+# 监控标的。code 为腾讯行情代码（主源），eastmoney 为东方财富 secid（备源）。
+# 注意东方财富的 100.NDX 是纳斯达克「综合」指数，纳指 100 必须用 100.NDX100。
 indices:
   - name: 纳斯达克100
     code: usNDX
-    yahoo: "^NDX"
+    eastmoney: "100.NDX100"
   - name: 标普500
     code: usINX
-    yahoo: "^GSPC"
+    eastmoney: "100.SPX"
   - name: 道琼斯
     code: usDJI
-    yahoo: "^DJI"
+    eastmoney: "100.DJIA"
 
 history:
   # 计算历史最高收盘价的起始日期。腾讯源最早可回溯到 2000-01-03，

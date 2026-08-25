@@ -5,6 +5,9 @@ on:
     # GitHub Actions 的 cron 使用 UTC。22:30 UTC 对应美东 17:30(EDT) / 17:30(EST)，
     # 两个时段都在收盘之后，因此夏令时切换无需改动。
     - cron: "30 22 * * 1-5"
+    # 周六的心跳：无论上周是否休市都一定发出，用来证明定时任务还活着。
+    # 没收到心跳就说明任务被停用了，而不是「本周恰好没有异动」。
+    - cron: "0 1 * * 6"
   workflow_dispatch:
     inputs:
       force:
@@ -39,10 +42,13 @@ jobs:
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           MAIL_FROM: ${{ secrets.MAIL_FROM }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
+          SCHEDULE: ${{ github.event.schedule }}
+          FORCE_INPUT: ${{ inputs.force }}
         run: |
-          python -m ndxmon.main \
-            --out out/preview.html \
-            ${{ inputs.force && '--force' || '' }}
+          FLAGS=""
+          [ "$SCHEDULE" = "0 1 * * 6" ] && FLAGS="$FLAGS --heartbeat"
+          [ "$FORCE_INPUT" = "true" ] && FLAGS="$FLAGS --force"
+          python -m ndxmon.main --out out/preview.html $FLAGS
 
       # 失败时保留渲染结果便于排查；任务本身失败会由 GitHub 自动发邮件给仓库所有者。
       - name: 保留渲染产物
